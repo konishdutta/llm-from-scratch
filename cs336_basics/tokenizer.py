@@ -7,14 +7,13 @@ if root_dir not in sys.path:
 from pathlib import Path
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
 import regex as re
 from typing import BinaryIO, Iterable, Iterator
 import multiprocessing
 from collections import Counter
 import pickle
 import heapq
-from tests.common import FIXTURES_PATH, gpt2_bytes_to_unicode
+
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -28,6 +27,7 @@ class BPETokenizerParams:
         self.vocab = vocab
         self.merges = merges
     
+
     @classmethod
     def from_vocab_merge_files(
         cls,
@@ -40,6 +40,7 @@ class BPETokenizerParams:
             merges = pickle.load(merges_file)
         return cls.from_vocab_and_ordered_merges(vocab, merges)
     
+
     @classmethod
     def from_vocab_and_ordered_merges(
         cls,
@@ -50,8 +51,7 @@ class BPETokenizerParams:
         reverse_vocab = {v: k for k, v in vocab.items()}
         merges = {(reverse_vocab[left_byte], reverse_vocab[right_byte]): reverse_vocab[_concat_bytes(left_byte, right_byte)]
                   for left_byte, right_byte in ordered_merges_list}
-        return cls(vocab, merges)
-    
+        return cls(vocab, merges)    
 
 
 class BPETokenizer:
@@ -76,7 +76,7 @@ class BPETokenizer:
         merges_filepath: str | os.PathLike,
         special_tokens: list[str] | None = None,
     ) -> "BPETokenizer":
-        params = BPETokenizerParams.from_vocab_merge_filesiles(vocab_filepath, merges_filepath)
+        params = BPETokenizerParams.from_vocab_merge_files(vocab_filepath, merges_filepath)
         return cls(params, special_tokens)
     
 
@@ -92,7 +92,6 @@ class BPETokenizer:
             raise ValueError(f"Expected BPETokenizerParams, got {type(params).__name__}")
         return cls(params, special_tokens)
     
-
 
     def encode(self, string: str) -> list[int]:
         # 1. Split into sections based on special tokens
@@ -117,8 +116,13 @@ class BPETokenizer:
         
         return res
     
+    
     def encode_iterable(self, iterable: Iterable[str],) -> Iterator[int]:
-        ...
+        for string in iterable:
+            if string in self.special_tokens:
+                yield self.special_tokens_to_id[string]
+            else:
+                yield from self.encode(string)
     
 
     def _encode_pretoken(self, text: str) -> list[int]:
@@ -269,7 +273,8 @@ def _pretokenize_chunk(
         chunk_size = 32 * 1024 * 1024,
     ) -> dict[tuple[int, ...], int]:
     if special_tokens:
-        pattern = "|".join(re.escape(token) for token in special_tokens)
+        ordered_special_tokens = sorted(set(special_tokens), key=len, reverse=True)
+        pattern = "|".join(re.escape(token) for token in ordered_special_tokens)
     else:
         pattern = None
     pretoken_counts = defaultdict(int)
@@ -481,16 +486,33 @@ def train_bpe_owt():
 
 
 if __name__ == '__main__':
-    VOCAB_PATH = FIXTURES_PATH / "gpt2_vocab.json"
-    MERGES_PATH = FIXTURES_PATH / "gpt2_merges.txt"
-    tokenizer = get_tokenizer_from_vocab_merges_path(
-        vocab_path=VOCAB_PATH,
-        merges_path=MERGES_PATH,
-    )
-    test_string = "s"
-    encoded_ids = tokenizer.encode(test_string)
-    decoded_string = tokenizer.decode(encoded_ids)
-    assert test_string == decoded_string
+    iter = [1, 2, 3, 4]
+    def practice_iterator(iter):
+        yield from iter
+    
+    """
+    a = practice_iterator(iter)
+    print(a)
+    for _ in range(5):
+        print(next(a))
+    """
+
+    groups = [[1, 2], [3], [4, 5, 6]]
+
+    def practice_iterator2(iter):
+        for item in iter:
+            if isinstance(item, list):
+                yield from item
+            else:
+                yield item
+        
+    b = practice_iterator2(groups)
+    for _ in range(7):
+        print(next(b))
+
+
+
+
     """
     text_files = os.path.abspath(os.path.join(root_dir, 'cs336_basics/test_files/test2.txt'))
     owt_params = os.path.abspath(os.path.join(root_dir, 'tokenizer/owt_params.pkl'))
