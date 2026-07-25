@@ -13,6 +13,7 @@ import multiprocessing
 from collections import Counter
 import pickle
 import heapq
+from functools import lru_cache
 
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -88,8 +89,6 @@ class BPETokenizer:
     ) -> "BPETokenizer":
         with open(param_path, 'rb') as file:
             params = pickle.load(file)
-        if not isinstance(params, BPETokenizerParams):
-            raise ValueError(f"Expected BPETokenizerParams, got {type(params).__name__}")
         return cls(params, special_tokens)
     
 
@@ -125,6 +124,7 @@ class BPETokenizer:
                 yield from self.encode(string)
     
 
+    @lru_cache(maxsize = 200_000)
     def _encode_pretoken(self, text: str) -> list[int]:
         pretoken = [self.reverse_vocab[bytes([x])] for x in text.encode('utf-8')]
 
@@ -485,44 +485,147 @@ def train_bpe_owt():
     save_params(params, "tokenizer", "owt_params")
 
 
+def iter_docs(
+    input_path: str | os.PathLike,
+    delimiter: str = "<|endoftext|>",
+    chunk_size: int = 1024 * 1024,
+):
+    leftover = ""
+    with open(input_path, 'r', encoding='utf-8') as file:
+        while chunk := file.read(chunk_size):
+            text = leftover + chunk
+            sections = text.split(delimiter)
+            leftover = sections.pop()
+
+            for document in sections:
+                if document:
+                    yield document    
+    if leftover:
+        yield leftover
+
+def sample_docs(
+    documents: Iterable[str],
+    sample_size: int = 10,
+    seed: int = 42,
+):
+    import random
+    rng = random.Random(seed)
+    sample: list[str] = []
+
+    for document_number, document in enumerate(documents):
+        if document_number < sample_size:
+            sample.append(document)
+        else:
+            replacement_index = rng.randint(0, document_number)
+            if replacement_index < sample_size:
+                sample[replacement_index] = document
+
+    return sample
+
+
 if __name__ == '__main__':
-    iter = [1, 2, 3, 4]
-    def practice_iterator(iter):
-        yield from iter
-    
-    """
-    a = practice_iterator(iter)
-    print(a)
-    for _ in range(5):
-        print(next(a))
-    """
-
-    groups = [[1, 2], [3], [4, 5, 6]]
-
-    def practice_iterator2(iter):
-        for item in iter:
-            if isinstance(item, list):
-                yield from item
-            else:
-                yield item
-        
-    b = practice_iterator2(groups)
-    for _ in range(7):
-        print(next(b))
-
-
-
-
-    """
-    text_files = os.path.abspath(os.path.join(root_dir, 'cs336_basics/test_files/test2.txt'))
+    tiny_stories_path = os.path.abspath(os.path.join(root_dir, 'data/TinyStoriesV2-GPT4-valid.txt'))
+    owt_path = os.path.abspath(os.path.join(root_dir, 'data/owt_valid.txt'))
     owt_params = os.path.abspath(os.path.join(root_dir, 'tokenizer/owt_params.pkl'))
-    owt_tokenizer = BPETokenizer.from_file(owt_params, ['<|endoftext|>'])
-    with open(text_files, 'r') as file:
-        text = file.read(1 * 1024 * 1024)
-        encoded_file = owt_tokenizer.encode(text)
-        print(text[:100])
-    print("encoded file\n", encoded_file[:100])
-    decoded_file = owt_tokenizer.decode(encoded_file)
-    print("decoded_file\n", decoded_file[:100])
-    assert text == decoded_file
-    """
+    ts_params = os.path.abspath(os.path.join(root_dir, 'tokenizer/tiny_stories_params.pkl'))
+    owt_tokenizer = BPETokenizer.from_param_file(owt_params, ['<|endoftext|>'])
+    ts_tokenizer = BPETokenizer.from_param_file(ts_params, ['<|endoftext|>'])
+
+    owt_iter = iter_docs(owt_path)
+    owt_docs = sample_docs(owt_iter)
+
+    ts_iter = iter_docs(tiny_stories_path)
+    ts_docs = sample_docs(ts_iter)
+
+    owt_string = "<|endoftext|>".join(owt_docs)
+    ts_string = "<|endoftext|>".join(ts_docs)
+
+    encoded_owt_owt = owt_tokenizer.encode(owt_string)
+    encoded_ts_ts = ts_tokenizer.encode(ts_string)
+    encoded_owt_ts = ts_tokenizer.encode(owt_string)
+    encoded_ts_owt = owt_tokenizer.encode(ts_string)
+
+    owt_owt_ratio = get_compression_ratio(owt_string, encoded_owt_owt)
+    ts_owt_ratio = get_compression_ratio(ts_string, encoded_ts_owt)
+
+    print("=== OWT Tokenizer Stats ===")
+    print(f"OWT Text: {owt_owt_ratio}")
+    print(f"TS Text: {ts_owt_ratio}")
+
+    ts_ts_ratio = get_compression_ratio(ts_string, encoded_ts_ts)
+    owt_ts_ratio = get_compression_ratio(owt_string, encoded_owt_ts)
+
+    print("=== TS Tokenizer Stats ===")
+    print(f"OWT Text: {owt_ts_ratio}")
+    print(f"TS Text: {ts_ts_ratio}")
+
+    import time
+    import numpy as np
+    ts_train_path = os.path.abspath(os.path.join(root_dir, 'data/TinyStoriesV2-GPT4-train.txt'))
+    owt_train_path = os.path.abspath(os.path.join(root_dir, 'data/owt_train.txt'))
+
+    owt_train_output = os.path.abspath(os.path.join(root_dir, 'tokenized_data/owt_train.bin'))
+    owt_val_output = os.path.abspath(os.path.join(root_dir, 'tokenized_data/owt_val.bin'))
+    ts_train_output = os.path.abspath(os.path.join(root_dir, 'tokenized_data/ts_train.bin'))
+    ts_val_output = os.path.abspath(os.path.join(root_dir, 'tokenized_data/ts_val.bin'))
+
+    trainer = [
+        {
+            "tokenizer": owt_tokenizer,
+            "raw_path": owt_train_path,
+            "output_path": owt_train_output,
+        },
+        {
+            "tokenizer": owt_tokenizer,
+            "raw_path": owt_path,
+            "output_path": owt_val_output,
+        },
+        {
+            "tokenizer": ts_tokenizer,
+            "raw_path": ts_train_path,
+            "output_path": ts_train_output,
+        },
+        {
+            "tokenizer": ts_tokenizer,
+            "raw_path": tiny_stories_path,
+            "output_path": ts_val_output,
+        },
+    ]
+
+    for train_dict in trainer:
+        tokenizer, input_path, output_path = train_dict["tokenizer"], train_dict["raw_path"], train_dict["output_path"]
+        buffer = []
+        end_token = tokenizer.special_tokens_to_id['<|endoftext|>']
+        total_bytes = 0.0
+        total_encode_seconds = 0.0
+        max_buffer_len = 1024 * 1024
+
+        with open(output_path, 'wb') as output_file:
+            doc_iterator = iter_docs(input_path)
+            for doc in doc_iterator:
+                total_bytes += len(doc.encode('utf-8'))
+
+                start = time.perf_counter()
+                encoded_doc = tokenizer.encode(doc)
+                total_encode_seconds += (time.perf_counter() - start)
+
+                buffer.extend(encoded_doc)
+                buffer.append(end_token)
+
+                if len(buffer) > max_buffer_len:
+                    np.asarray(buffer, dtype=np.uint16).tofile(output_file)
+                    buffer.clear()
+                    print(f"Total bytes processed: {total_bytes}")
+                    print(f"Total time encoded: {total_encode_seconds}")
+                    print(f"Bytes / second: {total_bytes / total_encode_seconds}")
+
+            if buffer:
+                np.asarray(buffer, dtype=np.uint16).tofile(output_file)
+
+    print("=== FINAL RESULTS ===")
+    print(f"Total bytes processed: {total_bytes}")
+    print(f"Total time encoded: {total_encode_seconds}")
+    print(f"Bytes / second: {total_bytes / total_encode_seconds}")
+    
+
+            
