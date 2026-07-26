@@ -17,9 +17,9 @@ class TransformerLM(nn.Module):
             dtype=None,
     ):
         super().__init__()
-        self.token_embeddings = Embedding(vocab_size, d_model, device, dtype)
+        self.token_embeddings = Embedding(vocab_size, d_model, device, dtype) # [bsz, seq_pos] -> seq
         self.layers = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, context_length,
+            TransformerBlock(d_model, num_heads, context_length, # norm -> 4d, attn -> 
                              d_ff, rope_theta, device, dtype)
             for _ in range(num_layers)
         ])
@@ -124,9 +124,9 @@ class SwiGLUMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden = self.w1(x)
-        silu = hidden * torch.sigmoid(hidden)
+        hidden = silu(hidden)
         gate = self.w3(x)
-        gated_hidden = silu * gate
+        gated_hidden = hidden * gate
         out = self.w2(gated_hidden)
         return out
 
@@ -197,6 +197,9 @@ class MultiHeadCausalSelfAttention(nn.Module):
         return out
 
 
+def silu(x: torch.Tensor) -> torch.Tensor:
+    return torch.sigmoid(x) * x
+
 
 def _init_weights(tensor: torch.Tensor, var: float) -> torch.Tensor:
     std = var ** 0.5
@@ -228,3 +231,73 @@ def scaled_dot_product_attention(
     probs = softmax(scores, dim=-1)
     out = einsum(probs, V, "bsz ... q_seq_len k_seq_len, bsz ... k_seq_len d_v -> bsz ... q_seq_len d_v")
     return out
+
+"""
+-- Q1 --
+vocab_size: 50,257
+context_length: 1,024
+num_layers: 48
+d_model: 1,600
+num_heads: 25
+d_ff: 4,288 (the nearest multiple of 64 to 8/3 x 1, 600)
+
+1. How much holds in memory?
+embedding table = 4 bytes * 50,257 x 1,600 = 321,644,800 bytes = 0.3216 GB
+
+each layer:
+    2 norms: 2 * 4 bytes * 1,600 = 12,800 bytes = 0.0000128 GB
+    q, k, v, o projections = 4 bytes * 4 * 1,600 * 1,600 = 0.04096 GB
+    w1, w2, w3 = 4 bytes * 4,288 * 1,600 * 3 = 0.08232 GB
+
+norm: 0.0000064 GB
+output head = 4 bytes * 1,600 * 50,257 = 0.3216 GB
+
+1,640,452,800 parameters
+
+Total: 643.21MB + 48 * 123.29MB = 6.56 GB
+
+-- Q2 --
+We found earlier
+FLOPS =
+L * 
+    (
+      10 * seq * d_model + 
+      4 * seq^2 * d_model +
+      8 * seq * d_model^2 +
+      5 * seq^2 * heads +
+      6 * d_ff * d_model * seq +
+      3 * d_ff * seq
+    ) +
+4 * d_model * seq + 2 * seq * d_model * vocab
+
+Plugging in our numbers:
+48 (16,384,000 + 6,710,886,400 + 20,971,520,000 + 131,072,000 + 42,152,755,200 + 13,172,736) + 6,553,600 + 164,682,137,600
+= 3,524,486,600,000
+
+Most expensive component is the LM head followed by the FFN
+
+-- Q4 --
+FLOPS =
+L * 
+    (
+      10 * seq * d_model + 
+      4 * seq^2 * d_model +
+      8 * seq * d_model^2 +
+      5 * seq^2 * head +
+      6 * d_ff * d_model * seq +
+      3 * d_ff * seq
+    ) +
+4 * d_model * seq + 2 * seq * d_model * vocab
+
+Plugging in our numbers:
+
+GPT-2 small (12 layers, 768 d_model, 12 heads, 2048 d_ff)
+12 (7,864,320 + 3,221,225,472 + 4,831,838,208 + 5,242,880 + 20,233,322,496 + 13,172,736) + 3,145,728 + 79047426048
+= 418,802,565,120 FLOPS
+
+
+GPT-2 medium 
+(24 layers, 1024 d_model, 16 heads)
+
+GPT-2 large (36 layers, 1280 d_model, 20 heads). 
+"""
