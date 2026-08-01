@@ -23,8 +23,8 @@ class TransformerLM(nn.Module):
                              d_ff, rope_theta, device, dtype)
             for _ in range(num_layers)
         ])
-        self.ln_final = RMSNorm(d_model)
-        self.lm_head = Linear(d_model, vocab_size)
+        self.ln_final = RMSNorm(d_model, dtype=dtype, device=device)
+        self.lm_head = Linear(d_model, vocab_size, dtype=dtype, device=device)
 
 
     def forward(self, x: torch.Tensor, token_positions = None) -> torch.Tensor:
