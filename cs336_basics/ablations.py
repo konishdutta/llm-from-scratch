@@ -38,14 +38,15 @@ base_config = TrainerConfig(
 experiments = [
     replace(
         base_config,
-        run_name="no_pos_ablation",
-        rope_theta=None,
+        run_name="aurora_02",
+        optimizer = Optimizer.Aurora,
+        max_aurora_lr = 1e-2
     ),
     replace(
         base_config,
-        run_name="swiglu_ablation",
-        d_ff=4 * base_config.d_model,
-        ffn_type='silu',
+        run_name="aurora_03",
+        optimizer = Optimizer.Aurora,
+        max_aurora_lr = 3e-2
     ),
 ]
 

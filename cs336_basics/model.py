@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from einops import rearrange, einsum
+from pathlib import Path
 
 
 class TransformerLM(nn.Module):
@@ -15,16 +16,35 @@ class TransformerLM(nn.Module):
             rope_theta=None,
             device=None,
             dtype=None,
+            rms_norm=True,
+            pre_norm=True,
+            ffn_type='swiglu',
     ):
         super().__init__()
         self.token_embeddings = Embedding(vocab_size, d_model, device, dtype) # [bsz, seq_pos] -> seq
         self.layers = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, context_length, # norm -> 4d, attn -> 
-                             d_ff, rope_theta, device, dtype)
+            TransformerBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                max_seq_len=context_length,
+                d_ff=d_ff,
+                rope_theta=rope_theta,
+                device=device,
+                dtype=dtype,
+                rms_norm=rms_norm,
+                pre_norm=pre_norm,
+                ffn_type=ffn_type,
+            )
             for _ in range(num_layers)
         ])
-        self.ln_final = RMSNorm(d_model, dtype=dtype, device=device)
+        self.ln_final = (
+            RMSNorm(d_model, dtype=dtype, device=device)
+            if rms_norm and pre_norm
+            else nn.Identity()
+        )
         self.lm_head = Linear(d_model, vocab_size, dtype=dtype, device=device)
+        self.context_length = context_length
+        self.device = device
 
 
     def forward(self, x: torch.Tensor, token_positions = None) -> torch.Tensor:
@@ -36,6 +56,12 @@ class TransformerLM(nn.Module):
         return logits
 
 
+def _make_norm(rms_norm, d_model, dtype, device):
+    if rms_norm:
+        return RMSNorm(d_model, dtype=dtype, device=device)
+    else:
+        return nn.Identity()
+
 class TransformerBlock(nn.Module):
     def __init__(
             self,
@@ -46,19 +72,32 @@ class TransformerBlock(nn.Module):
             rope_theta=None,
             device=None,
             dtype=None,
+            rms_norm=True,
+            pre_norm=True,
+            ffn_type='swiglu',
         ):
         super().__init__()
         self.attn = MultiHeadCausalSelfAttention(d_model, num_heads, max_seq_len, rope_theta=rope_theta, device=device, dtype=dtype)
-        self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
-        self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
-        self.ffn = SwiGLUMLP(d_model, d_ff=d_ff, device=device, dtype=dtype)
+        self.ln1 = _make_norm(rms_norm, d_model, dtype, device)
+        self.ln2 = _make_norm(rms_norm, d_model, dtype, device)
+        self.ffn = SwiGLUMLP(d_model, d_ff=d_ff, device=device, dtype=dtype, ffn_type=ffn_type)
+        self.pre_norm = pre_norm
 
 
     def forward(self, x: torch.Tensor, token_positions=None) -> torch.Tensor:
-        norm_x = self.ln1(x)
-        res_x = self.attn(norm_x, token_positions)
+        res_x = x
+        if self.pre_norm:
+            res_x = self.ln1(x)
+        res_x = self.attn(res_x, token_positions)
         y = x + res_x
-        z = y + self.ffn(self.ln2(y))
+        if not self.pre_norm:
+            y = self.ln1(y)
+        res_y = y
+        if self.pre_norm:
+            res_y = self.ln2(y)
+        z = y + self.ffn(res_y)
+        if not self.pre_norm:
+            z = self.ln2(z)
         return z
 
 class Linear(nn.Module):
@@ -113,21 +152,28 @@ class RMSNorm(nn.Module):
 
 
 class SwiGLUMLP(nn.Module):
-    def __init__(self, d_model: int, d_ff: int | None = None, device=None, dtype=None):
+    def __init__(self, d_model: int, d_ff: int | None = None, device=None, dtype=None, ffn_type: str="swiglu"):
         super().__init__()
         if d_ff is None:
-            d_ff = round((d_model * 8/3) / 64) * 64
+            if ffn_type == "swiglu":
+                d_ff = round((d_model * 8/3) / 64) * 64
+            else:
+                d_ff = 4 * d_model
         self.w1 = Linear(d_model, d_ff, device=device, dtype=dtype)
         self.w2 = Linear(d_ff, d_model, device=device, dtype=dtype)
-        self.w3 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        if ffn_type == "swiglu":
+            self.w3 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        else:
+            self.w3 = None
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden = self.w1(x)
         hidden = silu(hidden)
-        gate = self.w3(x)
-        gated_hidden = hidden * gate
-        out = self.w2(gated_hidden)
+        if self.w3 is not None:
+            gate = self.w3(x)
+            hidden = hidden * gate
+        out = self.w2(hidden)
         return out
 
 
@@ -231,6 +277,16 @@ def scaled_dot_product_attention(
     probs = softmax(scores, dim=-1)
     out = einsum(probs, V, "bsz ... q_seq_len k_seq_len, bsz ... k_seq_len d_v -> bsz ... q_seq_len d_v")
     return out
+
+if __name__ == '__main__':
+    model = TransformerLM(
+            vocab_size=100,
+            context_length=1000,
+            num_layers=6,
+            d_model=256,
+            num_heads=4,
+        )
+    print([k for k, v in model.named_parameters()])
 
 """
 -- Q1 --

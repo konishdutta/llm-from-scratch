@@ -55,8 +55,8 @@ class TrainerConfig:
     betas: Tuple[float, float] = (0.9, 0.999)
     weight_decay: float = 1e-2
     eps: float = 1e-8
-    aurora_mu=0.95
-    aurora_beta=0.5
+    aurora_mu: float = 0.95
+    aurora_beta: float = 0.5
     max_aurora_lr: float = 1e-3
     min_aurora_lr: float = 0
 
@@ -136,6 +136,9 @@ class Trainer:
                 lr=self.config.max_lr
             )}
         elif self.config.optimizer.name == 'Aurora':
+            print("Generating Aurora Optimizer")
+            print(f"{'optimizer':<10} | {'parameter name':<45} | {'shape':<20}")
+            print("-" * (10 + 20 + 45 + 6))
             # Use AdamW for non-matrix weights
             adam_names = {
                 'token_embeddings',
@@ -149,8 +152,10 @@ class Trainer:
             for name, param in self.model.named_parameters():
                 if any(keyword in name for keyword in adam_names) or param.ndim < 2:
                     adam_params.append(param)
+                    print(f"{'AdamW':<10} | {name:<45} | {str(tuple(param.shape)):<20}")
                 else:
                     aurora_params.append(param)
+                    print(f"{'Aurora':<10} | {name:<45} | {str(tuple(param.shape)):<20}")
             aurora = AuroraOptimizer(
                 aurora_params,
                 lr=self.config.max_aurora_lr,
@@ -166,6 +171,7 @@ class Trainer:
                 eps=self.config.eps,
                 weight_decay=self.config.weight_decay,
             )
+            
             return {"adamw": adam, "aurora": aurora}
 
         else:
@@ -413,10 +419,10 @@ def load_checkpoint(src, model, optimizer):
     if model_checkpoint is not None and model is not None:
         model.load_state_dict(model_checkpoint)
     if optimizer_checkpoint is not None and optimizer is not None:
-        for name, opt in optimizer_checkpoint:
+        for name, opt_state in optimizer_checkpoint.items():
             if name not in optimizer:
                 raise ValueError(f"got {name} in saved checkpoint, but not in config.")
-            optimizer[name].load_state_dict(opt[name])
+            optimizer[name].load_state_dict(opt_state)
     return obj.get("iteration", 0)
 
 
@@ -430,10 +436,10 @@ def load_config(src):
 
 def smoke_test():
     config = TrainerConfig(
-        run_name = "smoke_test_001",
+        run_name = "smoke_test_aurora_001",
         device = "cuda",
         dtype = torch.float32,
-        checkpoint_dir = Path(__file__).parent.parent.resolve() / "checkpoints" / "smoke_test",
+        checkpoint_dir = Path(__file__).parent.parent.resolve() / "checkpoints" / "smoke_test_aurora",
         snapshot_path = None,
         training_path = Path(__file__).parent.parent.resolve() / "tokenized_data" / "ts_val.bin",
         validation_path = Path(__file__).parent.parent.resolve() / "tokenized_data" / "ts_val.bin",
@@ -444,7 +450,7 @@ def smoke_test():
         num_heads = 8,
         d_ff = None,
         rope_theta = 10_000.0,
-        optimizer = Optimizer.AdamW,
+        optimizer = Optimizer.Aurora,
         max_lr = 1e-3,
         min_lr = 0,
         warmup_iters = 2,
@@ -463,11 +469,11 @@ def smoke_test():
 
 def resume_smoke():
     config = TrainerConfig(
-        run_name = "resume_smoke_001",
+        run_name = "resume_smoke_aurora_001",
         device = "cuda",
         dtype = torch.float32,
-        checkpoint_dir = Path(__file__).parent.parent.resolve() / "checkpoints" / "resume_smoke",
-        snapshot_path = Path(__file__).parent.parent.resolve() / "checkpoints" / "smoke_test" / "smoke_test_001_step_2.pt",
+        checkpoint_dir = Path(__file__).parent.parent.resolve() / "checkpoints" / "resume_smoke_aurora",
+        snapshot_path = Path(__file__).parent.parent.resolve() / "checkpoints" / "smoke_test_aurora" / "smoke_test_aurora_001_step_2.pt",
         training_path = Path(__file__).parent.parent.resolve() / "tokenized_data" / "ts_val.bin",
         validation_path = Path(__file__).parent.parent.resolve() / "tokenized_data" / "ts_val.bin",
         vocab_size = 10_000,
@@ -477,7 +483,7 @@ def resume_smoke():
         num_heads = 8,
         d_ff = None,
         rope_theta = 10_000.0,
-        optimizer = Optimizer.AdamW,
+        optimizer = Optimizer.Aurora,
         max_lr = 1e-3,
         min_lr = 0,
         warmup_iters = 2,
@@ -526,4 +532,5 @@ def train_tiny_stories():
     trainer.run()
 
 if __name__ == '__main__':
-    train_tiny_stories()
+    smoke_test()
+    resume_smoke()
