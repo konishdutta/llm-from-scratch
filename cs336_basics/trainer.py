@@ -1,4 +1,5 @@
 from .optimizer import AdamWOptimizer
+from .optimizer import AuroraOptimizer
 from .optimizer import SGDOptimizer
 from .optimizer import get_lr_cosine_schedule
 from .model import TransformerLM
@@ -6,6 +7,8 @@ from dataclasses import dataclass
 from enum import Enum
 import numpy as np
 from pathlib import Path
+import random
+import time
 import torch
 from typing import Tuple
 import wandb
@@ -14,6 +17,7 @@ import wandb
 class Optimizer(Enum):
     AdamW = AdamWOptimizer
     SGD = SGDOptimizer
+    Aurora = AuroraOptimizer
 
 
 @dataclass(kw_only=True)
@@ -37,6 +41,9 @@ class TrainerConfig:
     num_heads: int
     d_ff: int | None = None
     rope_theta: float | None = None
+    rms_norm: bool = True
+    pre_norm: bool = True
+    ffn_type: str = 'swiglu'
 
     # Optimizer hyperparameters
     optimizer: Optimizer = Optimizer.AdamW
@@ -48,12 +55,18 @@ class TrainerConfig:
     betas: Tuple[float, float] = (0.9, 0.999)
     weight_decay: float = 1e-2
     eps: float = 1e-8
+    aurora_mu=0.95
+    aurora_beta=0.5
+    max_aurora_lr: float = 1e-3
+    min_aurora_lr: float = 0
 
     # Trainer hyperparameters
     batch_size: int
     log_every: int | None = 1_000
     checkpoint_every: int | None = None
     eval_every: int | None = None
+    eval_batches: int = 20
+    seed: int | None = None
 
     def __post_init__(self):
         self.checkpoint_dir = Path(self.checkpoint_dir)
@@ -73,6 +86,10 @@ class TrainerConfig:
 class Trainer:
     def __init__(self, config: TrainerConfig):
         self.config = config
+        if config.seed is not None:
+            random.seed(config.seed)
+            np.random.seed(config.seed)
+            torch.manual_seed(config.seed)
         self.model = TransformerLM(
             vocab_size=config.vocab_size,
             context_length=config.context_length,
@@ -83,6 +100,9 @@ class Trainer:
             rope_theta=config.rope_theta,
             device=config.device,
             dtype=config.dtype,
+            rms_norm=config.rms_norm,
+            pre_norm=config.pre_norm,
+            ffn_type=config.ffn_type,
         )
         self.optimizer = self._create_optimizer()
         self.train_data = load_memmap(config.training_path)
@@ -95,22 +115,59 @@ class Trainer:
                 self.optimizer,
             )
         self.config.checkpoint_dir.mkdir(exist_ok=True, parents=True)
+        if self.config.rope_theta is not None:
+            self.token_positions = torch.arange(self.config.context_length, device=self.config.device)
+        else:
+            self.token_positions = None
 
 
     def _create_optimizer(self):
         if self.config.optimizer.name == 'AdamW':
-            return AdamWOptimizer(
+            return {"adamw": AdamWOptimizer(
                 self.model.parameters(),
                 lr=self.config.max_lr,
                 betas=self.config.betas,
                 eps=self.config.eps,
                 weight_decay=self.config.weight_decay,
-            )
+            )}
         elif self.config.optimizer.name == 'SGD':
-            return SGDOptimizer(
+            return {"sgd": SGDOptimizer(
                 self.model.parameters(),
                 lr=self.config.max_lr
+            )}
+        elif self.config.optimizer.name == 'Aurora':
+            # Use AdamW for non-matrix weights
+            adam_names = {
+                'token_embeddings',
+                'ln1',
+                'ln2',
+                'ln_final',
+                'lm_head',
+            }
+            adam_params = []
+            aurora_params = []
+            for name, param in self.model.named_parameters():
+                if any(keyword in name for keyword in adam_names) or param.ndim < 2:
+                    adam_params.append(param)
+                else:
+                    aurora_params.append(param)
+            aurora = AuroraOptimizer(
+                aurora_params,
+                lr=self.config.max_aurora_lr,
+                weight_decay=self.config.weight_decay,
+                mu=self.config.aurora_mu,
+                beta=self.config.aurora_beta,
+                eps=self.config.eps
             )
+            adam = AdamWOptimizer(
+                adam_params,
+                lr=self.config.max_lr,
+                betas=self.config.betas,
+                eps=self.config.eps,
+                weight_decay=self.config.weight_decay,
+            )
+            return {"adamw": adam, "aurora": aurora}
+
         else:
             raise ValueError(f"Unsupported optimizer: {self.config.optimizer.name}")
 
@@ -124,11 +181,20 @@ class Trainer:
                 "batch_size": self.config.batch_size,
                 "num_layers": self.config.num_layers,
                 "d_model": self.config.d_model,
+                "num_iters": self.config.num_iters,
+                "seed": self.config.seed,
+                "rms_norm": self.config.rms_norm,
+                "pre_norm": self.config.pre_norm,
             },
         ) as run:
+            run_start_time = time.perf_counter()
+            last_log_time = run_start_time
+            last_log_step = self.starting_step
             self.model.train()
             for step in range(self.starting_step, self.config.num_iters):
-                self.optimizer.zero_grad()
+                metrics = {}
+                for name, optimizer in self.optimizer.items():
+                    optimizer.zero_grad()
 
                 # set the learning rate
                 curr_lr = get_lr_cosine_schedule(
@@ -138,8 +204,23 @@ class Trainer:
                     self.config.warmup_iters,
                     self.config.anneal_iters,
                 )
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = curr_lr
+
+                # optional if using Aurora
+                curr_aurora_lr = get_lr_cosine_schedule(
+                    step,
+                    self.config.max_aurora_lr,
+                    self.config.min_aurora_lr,
+                    self.config.warmup_iters,
+                    self.config.anneal_iters,
+                )
+
+                for name, optimizer in self.optimizer.items():
+                    for param_group in optimizer.param_groups:
+                        if name == 'aurora':
+                            param_group['lr'] = curr_aurora_lr
+                        else:
+                            param_group['lr'] = curr_lr
+
 
                 # load data
                 sequence, target = load_data(
@@ -150,37 +231,95 @@ class Trainer:
                 )
 
                 # run the model and backprop
-                logits = self.model(sequence)
+                logits = self.model(sequence, token_positions=self.token_positions)
                 loss = cross_entropy(logits, target)
                 loss.backward()
                 completed_steps = step + 1
                 should_log = self._should_log(completed_steps)
                 if should_log:
                     grad_norm = self.compute_grad_norm()
-                self.optimizer.step()
+
+                for name, optimizer in self.optimizer.items():
+                    optimizer.step()
 
                 # checkpoint and log
                 if self._should_checkpoint(completed_steps):
                     out_path = self.config.checkpoint_dir / f"{self.config.run_name}_step_{completed_steps}.pt"
-                    save_checkpoint(self.model, self.optimizer, completed_steps, out_path)
+                    save_checkpoint(self.config, self.model, self.optimizer, completed_steps, out_path)
 
                 if should_log:
-                    self.log_training_metrics(run, completed_steps, loss, grad_norm)
-                    
+                    metrics |= self.build_training_metrics(loss, grad_norm, completed_steps)
 
-    def log_training_metrics(self, run, completed_steps, loss, grad_norm):
-        curr_lr = self.optimizer.param_groups[0]["lr"]
+                if self._should_eval(completed_steps):
+                    loss = self.run_eval()
+                    metrics |= self.build_eval_metrics(loss)
+
+                if metrics:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    now = time.perf_counter()
+                    elapsed_seconds = now - run_start_time
+                    interval_seconds = now - last_log_time
+                    interval_steps = completed_steps - last_log_step
+                    interval_tokens = (
+                        interval_steps
+                        * self.config.batch_size
+                        * self.config.context_length
+                    )
+                    metrics |= {
+                        "perf/session_wall_clock_seconds": elapsed_seconds,
+                        "perf/seconds_per_step": interval_seconds / interval_steps,
+                        "perf/tokens_per_second": interval_tokens / interval_seconds,
+                    }
+
+                    run.log(metrics, step=completed_steps)
+                    last_log_time = now
+                    last_log_step = completed_steps
+
+
+    def build_training_metrics(self, loss, grad_norm, completed_steps):
         tokens_seen = self.config.batch_size * self.config.context_length * completed_steps
-
-        run.log(
-            {
+        metrics = {
                 "train/loss": loss.item(),
-                "train/learning_rate": curr_lr,
                 "train/tokens_seen": tokens_seen,
                 "train/grad_norm": grad_norm.item(),
-            },
-            step = completed_steps
-        )
+            }
+        if "aurora" in self.optimizer:
+            metrics |= {"train/lr_aurora": self.optimizer['aurora'].param_groups[0]['lr']}
+        if "adamw" in self.optimizer:
+            metrics |= {"train/lr_adamw": self.optimizer['adamw'].param_groups[0]['lr']}
+        if "sgd" in self.optimizer:
+            metrics |= {"train/lr_sgd": self.optimizer['sgd'].param_groups[0]['lr']}
+
+        return metrics
+
+
+    def run_eval(self):
+        self.model.eval()
+        loss = torch.tensor(0.0, dtype=torch.float32, device=self.config.device)
+        with torch.no_grad():
+            for _ in range(self.config.eval_batches):
+                sequence, target = load_data(
+                    self.validation_data,
+                    batch_size=self.config.batch_size,
+                    context_length=self.config.context_length,
+                    device=self.config.device,
+                )
+                logits = self.model(sequence, token_positions=self.token_positions)
+                loss += cross_entropy(logits, target)
+
+            loss /= self.config.eval_batches
+        self.model.train()
+        return loss
+        
+
+    def build_eval_metrics(self, loss):
+        metrics = {
+                "eval/loss": loss.item(),
+                "eval/perplexity": torch.exp(loss).item()
+            }
+        return metrics
+
 
     def compute_grad_norm(self):
         sq_grad_norm = torch.tensor(0.0, dtype=torch.float32, device=self.config.device)
@@ -200,6 +339,11 @@ class Trainer:
         if self.config.log_every is None:
             return False
         return steps % self.config.log_every == 0 or steps == self.config.num_iters
+
+    def _should_eval(self, steps):
+        if self.config.eval_every is None:
+            return False
+        return steps % self.config.eval_every == 0 or steps == self.config.num_iters
 
 
 def load_memmap(filepath: str):
@@ -239,8 +383,25 @@ def load_data(
     return sequence, target
 
 
-def save_checkpoint(model, optimizer, iteration, out):
-    obj = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "iteration": iteration}
+def save_checkpoint(config, model, optimizer, iteration, out):
+    model_config = {
+        "vocab_size": config.vocab_size,
+        "context_length": config.context_length,
+        "num_layers": config.num_layers,
+        "d_model": config.d_model,
+        "num_heads": config.num_heads,
+        "d_ff": config.d_ff,
+        "rope_theta": config.rope_theta,
+        "device": config.device,
+        "dtype": config.dtype,
+        "rms_norm": config.rms_norm,
+        "pre_norm": config.pre_norm,
+        "ffn_type": config.ffn_type,
+    }
+
+    optimizer_state = {name: opt.state_dict() for name, opt in optimizer.items()}
+
+    obj = {"model": model.state_dict(), "optimizer": optimizer_state, "iteration": iteration, "config": model_config}
     torch.save(obj, out)
 
 
@@ -249,14 +410,25 @@ def load_checkpoint(src, model, optimizer):
     with torch.serialization.safe_globals([getattr, custom_class]):
         obj = torch.load(src)
     model_checkpoint, optimizer_checkpoint = obj.get("model", None), obj.get("optimizer", None)
-    if model_checkpoint is not None:
+    if model_checkpoint is not None and model is not None:
         model.load_state_dict(model_checkpoint)
-    if optimizer_checkpoint is not None:
-        optimizer.load_state_dict(optimizer_checkpoint)
+    if optimizer_checkpoint is not None and optimizer is not None:
+        for name, opt in optimizer_checkpoint:
+            if name not in optimizer:
+                raise ValueError(f"got {name} in saved checkpoint, but not in config.")
+            optimizer[name].load_state_dict(opt[name])
     return obj.get("iteration", 0)
 
 
-if __name__ == '__main__':
+def load_config(src):
+    custom_class = (None, "tests.test_serialization._TestNet")
+    with torch.serialization.safe_globals([getattr, custom_class]):
+        obj = torch.load(src)
+
+    return obj["config"]
+
+
+def smoke_test():
     config = TrainerConfig(
         run_name = "smoke_test_001",
         device = "cuda",
@@ -281,7 +453,77 @@ if __name__ == '__main__':
         batch_size = 4,
         log_every = 1,
         checkpoint_every = 2,
+        eval_every=1,
+        eval_batches=2,
     )
 
     trainer = Trainer(config)
     trainer.run()
+
+
+def resume_smoke():
+    config = TrainerConfig(
+        run_name = "resume_smoke_001",
+        device = "cuda",
+        dtype = torch.float32,
+        checkpoint_dir = Path(__file__).parent.parent.resolve() / "checkpoints" / "resume_smoke",
+        snapshot_path = Path(__file__).parent.parent.resolve() / "checkpoints" / "smoke_test" / "smoke_test_001_step_2.pt",
+        training_path = Path(__file__).parent.parent.resolve() / "tokenized_data" / "ts_val.bin",
+        validation_path = Path(__file__).parent.parent.resolve() / "tokenized_data" / "ts_val.bin",
+        vocab_size = 10_000,
+        context_length = 64,
+        num_layers = 6,
+        d_model = 256,
+        num_heads = 8,
+        d_ff = None,
+        rope_theta = 10_000.0,
+        optimizer = Optimizer.AdamW,
+        max_lr = 1e-3,
+        min_lr = 0,
+        warmup_iters = 2,
+        anneal_iters = 5,
+        num_iters = 5,
+        batch_size = 4,
+        log_every = 1,
+        checkpoint_every = 2,
+        eval_every=1
+    )
+
+    trainer = Trainer(config)
+    trainer.run()
+
+
+def train_tiny_stories():
+    config = TrainerConfig(
+        run_name = "ts_002",
+        device = "cuda",
+        dtype = torch.float32,
+        checkpoint_dir = Path(__file__).parent.parent.resolve() / "checkpoints" / "ts_002",
+        snapshot_path = None,
+        training_path = Path(__file__).parent.parent.resolve() / "tokenized_data" / "ts_train.bin",
+        validation_path = Path(__file__).parent.parent.resolve() / "tokenized_data" / "ts_val.bin",
+        vocab_size = 10_000,
+        context_length = 256,
+        num_layers = 4,
+        d_model = 512,
+        num_heads = 16,
+        d_ff = 1344,
+        rope_theta = 10_000.0,
+        optimizer = Optimizer.AdamW,
+        max_lr = 1e-3,
+        min_lr = 0,
+        warmup_iters = 8_000,
+        anneal_iters = 80_000,
+        num_iters = 80_000,
+        batch_size = 16,
+        log_every = 50,
+        checkpoint_every = 10_000,
+        eval_every = 250,
+        eval_batches=10,
+    )
+
+    trainer = Trainer(config)
+    trainer.run()
+
+if __name__ == '__main__':
+    train_tiny_stories()
